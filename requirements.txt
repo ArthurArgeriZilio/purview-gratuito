@@ -9,3 +9,6 @@ python-dotenv
 requests
 azure-synapse-artifacts
 azure-mgmt-datafactory
+azure-storage-blob
+pyodbcazure-storage-blob
+pyodbc

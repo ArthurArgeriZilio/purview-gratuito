@@ -69,6 +69,22 @@ class DBManager:
         self._create_rel_table("SQLContainsTable", "FROM Resource TO SQLTable")
         self._create_rel_table("SQLHasColumn", "FROM SQLTable TO SQLColumn")
         self._create_rel_table("SQLForeignKey", "FROM SQLTable TO SQLTable")
+        
+        # --- Storage Nodes ---
+        self._create_node_table("StorageAccount", "id STRING, name STRING, accountUrl STRING", "id")
+        self._create_node_table("BlobContainer", "id STRING, name STRING, publicAccess STRING, storageAccount STRING", "id")
+        self._create_node_table("Blob", "id STRING, name STRING, size INT64, contentType STRING, fileType STRING, container STRING", "id")
+        
+        # --- Classification Node ---
+        self._create_node_table("Classification", "id STRING, label STRING, category STRING, sensitivity STRING, confidence DOUBLE", "id")
+        
+        # --- Storage Edges ---
+        self._create_rel_table("StorageContains", "FROM StorageAccount TO BlobContainer")
+        self._create_rel_table("ContainerHasBlob", "FROM BlobContainer TO Blob")
+        
+        # --- Classification Edges ---
+        self._create_rel_table("HasClassification", "FROM SQLColumn TO Classification")
+        self._create_rel_table("BlobClassified", "FROM Blob TO Classification")
 
     def _create_node_table(self, name, schema, primary_key):
         try:
@@ -264,6 +280,61 @@ class DBManager:
         for rel in schema_data.get("relationships", []):
             self.conn.execute("MATCH (t1:SQLTable {id: $from}), (t2:SQLTable {id: $to}) MERGE (t1)-[:SQLForeignKey]->(t2)",
                               parameters={"from": rel["from_table"], "to": rel["to_table"]})
+
+    def upsert_storage_account(self, storage_data):
+        """Upsert storage account and its containers/blobs"""
+        account_id = storage_data['account_url']
+        
+        # 1. Storage Account
+        self.conn.execute("MERGE (s:StorageAccount {id: $id}) SET s.name = $name, s.accountUrl = $url",
+                          parameters={"id": account_id, "name": storage_data['account_name'], "url": storage_data['account_url']})
+        
+        # 2. Containers
+        for container in storage_data.get('containers', []):
+            container_id = f"{account_id}/{container['name']}"
+            
+            self.conn.execute("MERGE (c:BlobContainer {id: $id}) SET c.name = $name, c.publicAccess = $access, c.storageAccount = $sa",
+                              parameters={"id": container_id, "name": container['name'], 
+                                        "access": str(container.get('public_access', 'None')), "sa": account_id})
+            
+            self.conn.execute("MATCH (s:StorageAccount {id: $sid}), (c:BlobContainer {id: $cid}) MERGE (s)-[:StorageContains]->(c)",
+                              parameters={"sid": account_id, "cid": container_id})
+            
+            # 3. Blobs (limit to avoid overload)
+            for blob in container.get('blobs', [])[:500]:  # Limit 500 blobs per container
+                blob_id = f"{container_id}/{blob['name']}"
+                
+                self.conn.execute("""MERGE (b:Blob {id: $id}) 
+                                   SET b.name = $name, b.size = $size, b.contentType = $ct, 
+                                       b.fileType = $ft, b.container = $cont""",
+                                  parameters={"id": blob_id, "name": blob['name'], "size": blob.get('size', 0),
+                                            "ct": blob.get('content_type', 'unknown'), 
+                                            "ft": blob.get('file_type', 'unknown'),
+                                            "cont": container_id})
+                
+                self.conn.execute("MATCH (c:BlobContainer {id: $cid}), (b:Blob {id: $bid}) MERGE (c)-[:ContainerHasBlob]->(b)",
+                                  parameters={"cid": container_id, "bid": blob_id})
+    
+    def upsert_classification(self, asset_id, asset_type, classification_data):
+        """Link classification to SQL Column or Blob"""
+        class_id = f"{asset_id}_classification"
+        
+        # Create classification node
+        self.conn.execute("""MERGE (c:Classification {id: $id}) 
+                           SET c.label = $label, c.category = $category, 
+                               c.sensitivity = $sens, c.confidence = $conf""",
+                          parameters={"id": class_id, "label": classification_data['classification'],
+                                    "category": classification_data.get('category', 'Unknown'),
+                                    "sens": classification_data.get('sensitivity', 'Unknown'),
+                                    "conf": classification_data.get('confidence', 0.0)})
+        
+        # Link to asset
+        if asset_type == 'SQLColumn':
+            self.conn.execute("MATCH (col:SQLColumn {id: $aid}), (c:Classification {id: $cid}) MERGE (col)-[:HasClassification]->(c)",
+                              parameters={"aid": asset_id, "cid": class_id})
+        elif asset_type == 'Blob':
+            self.conn.execute("MATCH (b:Blob {id: $aid}), (c:Classification {id: $cid}) MERGE (b)-[:BlobClassified]->(c)",
+                              parameters={"aid": asset_id, "cid": class_id})
 
     def get_graph_stats(self):
         users = self.conn.execute("MATCH (u:User) RETURN count(u)").get_next()[0]
