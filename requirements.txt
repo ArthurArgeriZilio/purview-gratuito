@@ -1,0 +1,8 @@
+azure-identity
+azure-mgmt-resourcegraph
+msgraph-sdk
+kuzu
+streamlit
+pyvis
+pandas
+python-dotenv
