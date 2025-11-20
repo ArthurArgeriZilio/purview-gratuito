@@ -11,11 +11,14 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')
 
 from src.collectors.azure_collector import AzureCollector
 from src.collectors.m365_collector import M365Collector
+from src.collectors.powerbi_collector import PowerBICollector
+from src.collectors.synapse_collector import SynapseCollector
+from src.collectors.adf_collector import ADFCollector
 from src.database.db_manager import DBManager
 
 st.set_page_config(page_title="OpenPurview Local", layout="wide")
 
-st.title("OpenPurview Local 🛡️")
+st.title("OpenPurview Local")
 st.markdown("### Your Local, Free Azure & M365 Governance Tool")
 
 # Initialize DB
@@ -29,6 +32,9 @@ db = get_db()
 st.sidebar.header("Controls")
 scan_azure = st.sidebar.button("Scan Azure Resources")
 scan_m365 = st.sidebar.button("Scan M365 Users")
+scan_pbi = st.sidebar.button("Scan Power BI (Admin)")
+scan_synapse = st.sidebar.button("Scan Synapse Artifacts")
+scan_adf = st.sidebar.button("Scan Data Factory")
 
 # --- Main Logic ---
 
@@ -79,16 +85,132 @@ if scan_m365:
         except Exception as e:
             st.error(f"M365 Scan Failed: {e}")
 
+if scan_pbi:
+    with st.spinner("Scanning Power BI Tenant (Scanner API)..."):
+        try:
+            pbi = PowerBICollector()
+            
+            # 1. Get all Workspace IDs
+            st.info("Fetching all workspaces...")
+            workspaces = pbi.get_all_workspaces()
+            ws_ids = [w['id'] for w in workspaces]
+            
+            if not ws_ids:
+                st.warning("No workspaces found or Admin API access denied.")
+            else:
+                st.info(f"Found {len(ws_ids)} workspaces. Starting deep scan...")
+                
+                # 2. Run Scanner API
+                scan_results = pbi.run_scanner_api(ws_ids)
+                
+                # 3. Ingest Data
+                ws_count = 0
+                report_count = 0
+                dataset_count = 0
+                
+                for ws in scan_results:
+                    # Upsert Workspace
+                    db.upsert_pbi_workspace(ws)
+                    ws_count += 1
+                    
+                    # Upsert Reports
+                    for report in ws.get("reports", []):
+                        db.upsert_pbi_report(report, ws['id'])
+                        report_count += 1
+                        # Link Dataset -> Report
+                        if report.get("datasetId"):
+                            db.link_dataset_to_report(report.get("datasetId"), report.get("id"))
+                            
+                    # Upsert Datasets
+                    for dataset in ws.get("datasets", []):
+                        db.upsert_pbi_dataset(dataset, ws['id'])
+                        dataset_count += 1
+                
+                st.success(f"Scan Complete! Synced {ws_count} Workspaces, {report_count} Reports, {dataset_count} Datasets.")
+                
+        except Exception as e:
+            st.error(f"Power BI Scan Failed: {e}")
+
+if scan_synapse:
+    with st.spinner("Scanning Synapse Workspaces..."):
+        try:
+            # 1. Find Synapse Workspaces in DB (populated by Azure Scan)
+            # We look for resources with type 'microsoft.synapse/workspaces'
+            # Note: Azure Resource Graph returns types in lowercase usually.
+            ws_df = db.conn.execute("MATCH (r:Resource) WHERE r.type =~ '(?i)microsoft.synapse/workspaces' RETURN r.id, r.name").get_as_df()
+            
+            if ws_df.empty:
+                st.warning("No Synapse Workspaces found in local DB. Please run 'Scan Azure Resources' first.")
+            else:
+                synapse_col = SynapseCollector()
+                count = 0
+                
+                for index, row in ws_df.iterrows():
+                    ws_name = row[1]
+                    ws_id = row[0]
+                    
+                    st.write(f"Scanning Workspace: **{ws_name}**")
+                    artifacts = synapse_col.scan_workspace_artifacts(ws_name)
+                    
+                    db.upsert_synapse_artifacts(ws_id, artifacts)
+                    
+                    n_pipelines = len(artifacts['pipelines'])
+                    n_notebooks = len(artifacts['notebooks'])
+                    st.caption(f"Found {n_pipelines} pipelines, {n_notebooks} notebooks.")
+                    count += 1
+                
+                st.success(f"Scanned {count} Synapse Workspaces.")
+
+        except Exception as e:
+            st.error(f"Synapse Scan Failed: {e}")
+
+if scan_adf:
+    with st.spinner("Scanning Azure Data Factories..."):
+        try:
+            # 1. Find ADFs in DB
+            adf_df = db.conn.execute("MATCH (r:Resource) WHERE r.type =~ '(?i)microsoft.datafactory/factories' RETURN r.id, r.name, r.resourceGroup, r.subscriptionId").get_as_df()
+            
+            if adf_df.empty:
+                st.warning("No Data Factories found in local DB. Please run 'Scan Azure Resources' first.")
+            else:
+                count = 0
+                for index, row in adf_df.iterrows():
+                    adf_id = row[0]
+                    adf_name = row[1]
+                    rg_name = row[2]
+                    sub_id = row[3]
+                    
+                    st.write(f"Scanning ADF: **{adf_name}**")
+                    
+                    # Initialize collector with specific subscription
+                    adf_col = ADFCollector(sub_id)
+                    artifacts = adf_col.scan_adf(rg_name, adf_name)
+                    
+                    db.upsert_adf_artifacts(adf_id, artifacts)
+                    
+                    n_pipes = len(artifacts['pipelines'])
+                    n_ds = len(artifacts['datasets'])
+                    st.caption(f"Found {n_pipes} pipelines, {n_ds} datasets.")
+                    count += 1
+                
+                st.success(f"Scanned {count} Data Factories.")
+
+        except Exception as e:
+            st.error(f"ADF Scan Failed: {e}")
+
 # --- Dashboard ---
 
-tab1, tab2, tab3 = st.tabs(["📊 Overview", "🔎 Asset Search", "🕸️ Graph Explorer"])
+tab1, tab2, tab3 = st.tabs(["Overview", "Asset Search", "Graph Explorer"])
 
 with tab1:
     st.subheader("Inventory Stats")
     stats = db.get_graph_stats()
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     col1.metric("Total Users", stats["users"])
     col2.metric("Total Azure Resources", stats["resources"])
+    # Add PBI stats if available in get_graph_stats, or just leave as is for now
+    # Ideally update get_graph_stats to return PBI counts too
+
 
 with tab2:
     st.subheader("Search Database")

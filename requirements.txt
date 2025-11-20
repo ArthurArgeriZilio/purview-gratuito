@@ -6,3 +6,6 @@ streamlit
 pyvis
 pandas
 python-dotenv
+requests
+azure-synapse-artifacts
+azure-mgmt-datafactory
