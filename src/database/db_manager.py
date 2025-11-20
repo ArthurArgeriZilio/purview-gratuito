@@ -61,6 +61,15 @@ class DBManager:
         self._create_rel_table("ADFContainsDataset", "FROM Resource TO ADFDataset")
         self._create_rel_table("ADFContainsLinkedService", "FROM Resource TO ADFLinkedService")
 
+        # --- SQL Schema Nodes ---
+        self._create_node_table("SQLTable", "id STRING, schema STRING, name STRING, full_name STRING", "id")
+        self._create_node_table("SQLColumn", "id STRING, name STRING, data_type STRING, is_nullable BOOLEAN", "id")
+
+        # --- SQL Schema Edges ---
+        self._create_rel_table("SQLContainsTable", "FROM Resource TO SQLTable")
+        self._create_rel_table("SQLHasColumn", "FROM SQLTable TO SQLColumn")
+        self._create_rel_table("SQLForeignKey", "FROM SQLTable TO SQLTable")
+
     def _create_node_table(self, name, schema, primary_key):
         try:
             self.conn.execute(f"CREATE NODE TABLE {name}({schema}, PRIMARY KEY ({primary_key}))")
@@ -235,6 +244,26 @@ class DBManager:
                               parameters={"id": ls["id"], "name": ls["name"], "type": ls["type"], "fac": ls["factory_name"]})
             self.conn.execute("MATCH (r:Resource {id: $rid}), (n:ADFLinkedService {id: $nid}) MERGE (r)-[:ADFContainsLinkedService]->(n)",
                               parameters={"rid": factory_resource_id, "nid": ls["id"]})
+
+    def upsert_sql_schema(self, database_resource_id, schema_data):
+        # 1. Tables
+        for table in schema_data.get("tables", []):
+            self.conn.execute("MERGE (t:SQLTable {id: $id}) SET t.schema = $schema, t.name = $name, t.full_name = $full",
+                              parameters={"id": table["id"], "schema": table["schema"], "name": table["name"], "full": table["full_name"]})
+            self.conn.execute("MATCH (r:Resource {id: $rid}), (t:SQLTable {id: $tid}) MERGE (r)-[:SQLContainsTable]->(t)",
+                              parameters={"rid": database_resource_id, "tid": table["id"]})
+
+        # 2. Columns
+        for col in schema_data.get("columns", []):
+            self.conn.execute("MERGE (c:SQLColumn {id: $id}) SET c.name = $name, c.data_type = $dtype, c.is_nullable = $nullable",
+                              parameters={"id": col["id"], "name": col["name"], "dtype": col["data_type"], "nullable": col["is_nullable"]})
+            self.conn.execute("MATCH (t:SQLTable {id: $tid}), (c:SQLColumn {id: $cid}) MERGE (t)-[:SQLHasColumn]->(c)",
+                              parameters={"tid": col["table_id"], "cid": col["id"]})
+
+        # 3. Foreign Keys
+        for rel in schema_data.get("relationships", []):
+            self.conn.execute("MATCH (t1:SQLTable {id: $from}), (t2:SQLTable {id: $to}) MERGE (t1)-[:SQLForeignKey]->(t2)",
+                              parameters={"from": rel["from_table"], "to": rel["to_table"]})
 
     def get_graph_stats(self):
         users = self.conn.execute("MATCH (u:User) RETURN count(u)").get_next()[0]
